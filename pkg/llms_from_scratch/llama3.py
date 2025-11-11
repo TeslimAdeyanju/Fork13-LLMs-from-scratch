@@ -205,6 +205,58 @@ class GroupedQueryAttention(nn.Module):
         return context_vec
 
 
+# ==============================================================================
+# RoPE implementation summary
+#
+#
+# There are two common styles to implement RoPE, which are
+# mathematically equivalent;
+# they mainly differ in how the rotation matrix pairs dimensions.
+#
+# 1) Split-halves style (this repo, Hugging Face Transformers):
+#
+#   For hidden dim d = 8 (example):
+#
+#       [ x0   x1   x2   x3   x4   x5   x6   x7 ]
+#         │    │    │    │    │    │    │    │
+#         ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
+#        cos  cos  cos  cos  sin  sin  sin  sin
+#
+#   Rotation matrix:
+#
+#       [ cosθ   -sinθ    0      0   ... ]
+#       [ sinθ    cosθ    0      0   ... ]
+#       [  0       0    cosθ   -sinθ ... ]
+#       [  0       0    sinθ    cosθ ... ]
+#        ...
+#
+#   Here, the embedding dims are split into two halves and then
+#   each one is rotated in blocks.
+#
+#
+# 2) Interleaved (even/odd) style (original paper, Llama repo):
+#
+#   For hidden dim d = 8 (example):
+#
+#       [ x0   x1   x2   x3   x4   x5   x6   x7 ]
+#         │    │    │    │    │    │    │    │
+#         ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
+#        cos  sin  cos  sin  cos  sin  cos  sin
+#
+#   Rotation matrix:
+#       [ cosθ  -sinθ    0      0   ... ]
+#       [ sinθ   cosθ    0      0   ... ]
+#       [  0      0    cosθ   -sinθ ... ]
+#       [  0      0    sinθ    cosθ ... ]
+#        ...
+#
+#   Here, embedding dims are interleaved as even/odd cosine/sine pairs.
+#
+# Both layouts encode the same relative positions; the only difference is how
+# dimensions are paired.
+# ==============================================================================
+
+
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, freq_config=None, dtype=torch.float32):
     assert head_dim % 2 == 0, "Embedding dimension must be even"
 
@@ -238,7 +290,7 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, freq_c
     positions = torch.arange(context_length, dtype=dtype)
 
     # Compute the angles
-    angles = positions[:, None] * inv_freq[None, :]  # Shape: (context_length, head_dim // 2)
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # Shape: (context_length, head_dim // 2)
 
     # Expand angles to match the head_dim
     angles = torch.cat([angles, angles], dim=1)  # Shape: (context_length, head_dim)
@@ -503,13 +555,17 @@ def assign(left, right, tensor_name="unknown"):
     if left.shape != right.shape:
         raise ValueError(f"Shape mismatch in tensor '{tensor_name}'. Left: {left.shape}, Right: {right.shape}")
 
-    if isinstance(right, torch.Tensor):
-        return torch.nn.Parameter(right.clone().detach())
-    else:
-        return torch.nn.Parameter(torch.tensor(right))
+    with torch.no_grad():
+        if isinstance(right, torch.Tensor):
+            left.copy_(right)
+        else:
+            left.copy_(torch.as_tensor(right, dtype=left.dtype, device=left.device))
+
+    return left
 
 
 def load_weights_into_llama(model, param_config, params):
+
     model.tok_emb.weight = assign(model.tok_emb.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
 
     for l in range(param_config["n_layers"]):
@@ -569,5 +625,5 @@ def load_weights_into_llama(model, param_config, params):
     if "lm_head.weight" in params.keys():
         model.out_head.weight = assign(model.out_head.weight, params["lm_head.weight"], "lm_head.weight")
     else:
-        model.out_head.weight = assign(model.out_head.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
+        model.out_head.weight = model.tok_emb.weight
         print("Model uses weight tying.")

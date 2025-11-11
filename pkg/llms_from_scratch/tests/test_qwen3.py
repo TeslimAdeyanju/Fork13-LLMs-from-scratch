@@ -11,6 +11,7 @@ from llms_from_scratch.qwen3 import (
     QWEN_CONFIG_06_B,
     Qwen3Model,
     Qwen3Tokenizer,
+    MoEFeedForward,
     RMSNorm,
 )
 from llms_from_scratch.kv_cache.qwen3 import Qwen3Model as Qwen3ModelKV
@@ -20,7 +21,12 @@ from llms_from_scratch.kv_cache.generate import generate_text_simple as generate
 from llms_from_scratch.kv_cache_batched.qwen3 import Qwen3Model as Qwen3ModelKVBatched
 from llms_from_scratch.kv_cache_batched.generate import generate_text_simple as generate_text_simple_batched
 
+from llms_from_scratch.utils import download_file
+
 import importlib
+import os
+import shutil
+import tempfile
 import platform
 import pytest
 import torch
@@ -104,8 +110,38 @@ def test_dummy_qwen3_moe_forward(dummy_cfg_moe, dummy_input):
     out = model(dummy_input)
     assert out.shape == (1, dummy_input.size(1), dummy_cfg_moe["vocab_size"]), \
         f"Expected shape (1, seq_len, vocab_size), got {out.shape}"
-    assert any(hasattr(block.ff, 'gate') for block in model.trf_blocks), \
+    assert any(hasattr(block.ff, "gate") for block in model.trf_blocks), \
         "Expected MoEFeedForward in at least one transformer block"
+
+
+@torch.inference_mode()
+def test_moe_forward_matches_reference(dummy_cfg_moe):
+    torch.manual_seed(0)
+    moe = MoEFeedForward(dummy_cfg_moe)
+    x = torch.randn(2, 5, dummy_cfg_moe["emb_dim"])
+
+    scores = moe.gate(x)
+    topk_scores, topk_indices = torch.topk(scores, moe.num_experts_per_tok, dim=-1)
+    topk_probs = torch.softmax(topk_scores, dim=-1)
+
+    expert_outputs = []
+    for e in range(moe.num_experts):
+        hidden = torch.nn.functional.silu(moe.fc1[e](x)) * moe.fc2[e](x)
+        out = moe.fc3[e](hidden)
+        expert_outputs.append(out.unsqueeze(-2))
+    expert_outputs = torch.cat(expert_outputs, dim=-2)
+
+    gating_probs = torch.zeros_like(scores)
+    for i in range(moe.num_experts_per_tok):
+        indices = topk_indices[..., i:i+1]
+        prob = topk_probs[..., i:i+1]
+        gating_probs.scatter_(dim=-1, index=indices, src=prob)
+    gating_probs = gating_probs.unsqueeze(-1)
+
+    expected = (gating_probs * expert_outputs).sum(dim=-2)
+
+    actual = moe(x)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 @torch.inference_mode()
@@ -465,13 +501,6 @@ def test_chat_wrap_and_equivalence(add_gen, add_think):
             add_generation_prompt=add_gen,
             enable_thinking=add_think,
         )
-        ours = qt.encode(prompt)
-        ref = hf_tok.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=add_gen,
-            enable_thinking=add_think,
-        )
 
         if add_gen and not add_think:
             pass  # skip edge case as this is not something we use in practice
@@ -532,6 +561,72 @@ def test_multiturn_equivalence(repo_id, tok_file, add_gen, add_think):
     ours_dec = qt.decode(ours_ids)
     ref_dec = hf_tok.decode(ref_ids, skip_special_tokens=False)
     assert ours_dec == ref_dec
+
+
+@pytest.mark.skipif(not transformers_installed, reason="transformers not installed")
+def test_tokenizer_equivalence():
+    from transformers import AutoTokenizer
+
+    prompt = "Give me a short introduction to large language models."
+    messages = [
+        {"role": "user", "content": prompt},
+    ]
+
+    for apply_chat_template in (True, False):
+        for s in ("-Base", ""):
+            repo_id = f"Qwen/Qwen3-0.6B{s}"
+            tokenizer_ref = AutoTokenizer.from_pretrained(repo_id)
+            tokenizer_url = f"https://huggingface.co/Qwen/Qwen3-0.6B{s}/resolve/main/tokenizer.json"
+            download_file(tokenizer_url, out_dir=".")
+
+            old_name = "tokenizer.json"
+
+            if not s:
+                new_name = "tokenizer-reasoning.json"
+            else:
+                new_name = "tokenizer-base.json"
+
+            try:
+                shutil.move(old_name, new_name)
+            except Exception:
+                with tempfile.NamedTemporaryFile(delete=False, dir=".") as tmp_file:
+                    shutil.copyfile(old_name, tmp_file.name)
+                    os.replace(tmp_file.name, new_name)
+                os.remove(old_name)
+
+            for states in ((True, True), (False, False)):
+                tokenizer = Qwen3Tokenizer(
+                    tokenizer_file_path=new_name,
+                    repo_id=repo_id,
+                    apply_chat_template=apply_chat_template,
+                    add_generation_prompt=states[0],
+                    add_thinking=states[1]
+                )
+                input_token_ids = tokenizer.encode(prompt)
+
+                if apply_chat_template:
+                    input_token_ids_ref = tokenizer_ref.apply_chat_template(
+                        messages,
+                        tokenize=True,
+                        add_generation_prompt=states[0],
+                        enable_thinking=states[1],
+                    )
+                else:
+                    input_token_ids_ref = input_token_ids
+
+                assert input_token_ids == input_token_ids_ref, states
+
+                output_text = tokenizer.decode(input_token_ids)
+                out_text_ref = tokenizer_ref.decode(input_token_ids_ref)
+                assert output_text == out_text_ref, states
+
+                assert tokenizer.encode("<|endoftext|>") == [tokenizer._special_to_id["<|endoftext|>"]]
+                assert tokenizer.encode("<|im_end|>") == [tokenizer._special_to_id["<|im_end|>"]]
+
+                expected_eos_token = "<|im_end|>" if "base" not in new_name else "<|endoftext|>"
+                expected_pad_token = "<|endoftext|>"
+                assert tokenizer.decode([tokenizer.eos_token_id]) == expected_eos_token
+                assert tokenizer.decode([tokenizer.pad_token_id]) == expected_pad_token
 
 
 @pytest.mark.skipif(not transformers_installed, reason="transformers not installed")

@@ -6,9 +6,9 @@
 import os
 import json
 import re
-import urllib.request
 from pathlib import Path
 
+import requests
 import torch
 import torch.nn as nn
 
@@ -64,7 +64,7 @@ QWEN3_CONFIG_8B = {
     "context_length": 40_960,
     "emb_dim": 4096,                 # 60% larger than above
     "n_heads": 32,
-    "n_layers": 36,                 
+    "n_layers": 36,
     "hidden_dim": 12288,             # 26% larger than above
     "head_dim": 128,
     "qk_norm": True,
@@ -215,14 +215,14 @@ class MoEFeedForward(nn.Module):
         super().__init__()
         self.num_experts_per_tok = cfg["num_experts_per_tok"]
         self.num_experts = cfg["num_experts"]
+        self.emb_dim = cfg["emb_dim"]
         self.gate = nn.Linear(cfg["emb_dim"], cfg["num_experts"], bias=False, dtype=cfg["dtype"])
 
-        meta_device = torch.device("meta")  # to reduce memory pressure and only load them when used (trades compute for memory)
-        self.fc1 = nn.ModuleList([nn.Linear(cfg["emb_dim"], cfg["moe_intermediate_size"], bias=False, dtype=cfg["dtype"], device=meta_device)
+        self.fc1 = nn.ModuleList([nn.Linear(cfg["emb_dim"], cfg["moe_intermediate_size"], bias=False, dtype=cfg["dtype"])
                                   for _ in range(cfg["num_experts"])])
-        self.fc2 = nn.ModuleList([nn.Linear(cfg["emb_dim"], cfg["moe_intermediate_size"], bias=False, dtype=cfg["dtype"], device=meta_device)
+        self.fc2 = nn.ModuleList([nn.Linear(cfg["emb_dim"], cfg["moe_intermediate_size"], bias=False, dtype=cfg["dtype"])
                                   for _ in range(cfg["num_experts"])])
-        self.fc3 = nn.ModuleList([nn.Linear(cfg["moe_intermediate_size"], cfg["emb_dim"], bias=False, dtype=cfg["dtype"], device=meta_device)
+        self.fc3 = nn.ModuleList([nn.Linear(cfg["moe_intermediate_size"], cfg["emb_dim"], bias=False, dtype=cfg["dtype"])
                                   for _ in range(cfg["num_experts"])])
 
     def forward(self, x):
@@ -230,24 +230,37 @@ class MoEFeedForward(nn.Module):
         topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
         topk_probs = torch.softmax(topk_scores, dim=-1)
 
-        expert_outputs = []
-        for e in range(self.num_experts):
-            hidden = torch.nn.functional.silu(self.fc1[e](x)) * self.fc2[e](x)
-            out = self.fc3[e](hidden)
-            expert_outputs.append(out.unsqueeze(-2))
-        expert_outputs = torch.cat(expert_outputs, dim=-2)  # (b, t, num_experts, emb_dim)
+        batch, seq_len, _ = x.shape
+        x_flat = x.reshape(batch * seq_len, -1)
+        out_flat = torch.zeros(batch * seq_len, self.emb_dim, device=x.device, dtype=x.dtype)
 
-        gating_probs = torch.zeros_like(scores)
+        topk_indices_flat = topk_indices.reshape(-1, self.num_experts_per_tok)
+        topk_probs_flat = topk_probs.reshape(-1, self.num_experts_per_tok)
 
-        for i in range(self.num_experts_per_tok):
-            indices = topk_indices[..., i:i+1]
-            prob = topk_probs[..., i:i+1]
-            gating_probs.scatter_(dim=-1, index=indices, src=prob)
-        gating_probs = gating_probs.unsqueeze(-1)  # (b, t, num_experts, 1)
+        unique_experts = torch.unique(topk_indices_flat)
 
-        # Weighted sum over experts
-        y = (gating_probs * expert_outputs).sum(dim=-2)
-        return y
+        for expert_id_tensor in unique_experts:
+            expert_id = int(expert_id_tensor.item())
+            mask = topk_indices_flat == expert_id
+            if not mask.any():
+                continue
+
+            token_mask = mask.any(dim=-1)
+            selected_idx = token_mask.nonzero(as_tuple=False).squeeze(-1)
+            if selected_idx.numel() == 0:
+                continue
+
+            expert_input = x_flat.index_select(0, selected_idx)
+            hidden = torch.nn.functional.silu(self.fc1[expert_id](expert_input)) * self.fc2[expert_id](expert_input)
+            expert_out = self.fc3[expert_id](hidden)
+
+            mask_selected = mask[selected_idx]
+            slot_indices = mask_selected.int().argmax(dim=-1, keepdim=True)
+            selected_probs = torch.gather(topk_probs_flat.index_select(0, selected_idx), dim=-1, index=slot_indices).squeeze(-1)
+
+            out_flat.index_add_(0, selected_idx, expert_out * selected_probs.unsqueeze(-1))
+
+        return out_flat.reshape(batch, seq_len, self.emb_dim)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -316,6 +329,58 @@ class GroupedQueryAttention(nn.Module):
         return self.out_proj(context)
 
 
+# ==============================================================================
+# RoPE implementation summary
+#
+#
+# There are two common styles to implement RoPE, which are
+# mathematically equivalent;
+# they mainly differ in how the rotation matrix pairs dimensions.
+#
+# 1) Split-halves style (this repo, Hugging Face Transformers):
+#
+#   For hidden dim d = 8 (example):
+#
+#       [ x0   x1   x2   x3   x4   x5   x6   x7 ]
+#         │    │    │    │    │    │    │    │
+#         ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
+#        cos  cos  cos  cos  sin  sin  sin  sin
+#
+#   Rotation matrix:
+#
+#       [ cosθ   -sinθ    0      0   ... ]
+#       [ sinθ    cosθ    0      0   ... ]
+#       [  0       0    cosθ   -sinθ ... ]
+#       [  0       0    sinθ    cosθ ... ]
+#        ...
+#
+#   Here, the embedding dims are split into two halves and then
+#   each one is rotated in blocks.
+#
+#
+# 2) Interleaved (even/odd) style (original paper, Llama repo):
+#
+#   For hidden dim d = 8 (example):
+#
+#       [ x0   x1   x2   x3   x4   x5   x6   x7 ]
+#         │    │    │    │    │    │    │    │
+#         ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
+#        cos  sin  cos  sin  cos  sin  cos  sin
+#
+#   Rotation matrix:
+#       [ cosθ  -sinθ    0      0   ... ]
+#       [ sinθ   cosθ    0      0   ... ]
+#       [  0      0    cosθ   -sinθ ... ]
+#       [  0      0    sinθ    cosθ ... ]
+#        ...
+#
+#   Here, embedding dims are interleaved as even/odd cosine/sine pairs.
+#
+# Both layouts encode the same relative positions; the only difference is how
+# dimensions are paired.
+# ==============================================================================
+
+
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
     assert head_dim % 2 == 0, "Embedding dimension must be even"
 
@@ -326,7 +391,7 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=
     positions = torch.arange(context_length, dtype=dtype)
 
     # Compute the angles
-    angles = positions[:, None] * inv_freq[None, :]  # Shape: (context_length, head_dim // 2)
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0) # Shape: (context_length, head_dim // 2)
 
     # Expand angles to match the head_dim
     angles = torch.cat([angles, angles], dim=1)  # Shape: (context_length, head_dim)
@@ -387,7 +452,14 @@ def load_weights_into_qwen(model, param_config, params):
     def assign(left, right, tensor_name="unknown"):
         if left.shape != right.shape:
             raise ValueError(f"Shape mismatch in tensor '{tensor_name}'. Left: {left.shape}, Right: {right.shape}")
-        return torch.nn.Parameter(right.clone().detach() if isinstance(right, torch.Tensor) else torch.tensor(right))
+
+        with torch.no_grad():
+            if isinstance(right, torch.Tensor):
+                left.copy_(right)
+            else:
+                left.copy_(torch.as_tensor(right, dtype=left.dtype, device=left.device))
+
+        return left
 
     model.tok_emb.weight = assign(model.tok_emb.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
 
@@ -441,7 +513,7 @@ def load_weights_into_qwen(model, param_config, params):
         )
 
         # Feedforward weights
-        if "num_experts" in param_config:
+        if param_config.get("num_experts", 0) > 0:
             # Load router (gating) weights
             block.ff.gate.weight = assign(
                 block.ff.gate.weight,
@@ -466,10 +538,6 @@ def load_weights_into_qwen(model, param_config, params):
                     params[f"{prefix}.down_proj.weight"],
                     f"{prefix}.down_proj.weight"
                 )
-                # After assigning weights, move the expert layers from meta to CPU
-                block.ff.fc1[e] = block.ff.fc1[e].to("cpu")
-                block.ff.fc2[e] = block.ff.fc2[e].to("cpu")
-                block.ff.fc3[e] = block.ff.fc3[e].to("cpu")
 
         else:
             block.ff.fc1.weight = assign(
@@ -500,9 +568,8 @@ def load_weights_into_qwen(model, param_config, params):
     if "lm_head.weight" in params:
         model.out_head.weight = assign(model.out_head.weight, params["lm_head.weight"], "lm_head.weight")
     else:
-        # Model uses weight tying, hence we reuse the embedding layer weights here
+        model.out_head.weight = model.tok_emb.weight
         print("Model uses weight tying.")
-        model.out_head.weight = assign(model.out_head.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
 
 
 class Qwen3Tokenizer:
@@ -593,7 +660,12 @@ def download_from_huggingface(repo_id, filename, local_dir, revision="main"):
         print(f"File already exists: {dest_path}")
     else:
         print(f"Downloading {url} to {dest_path}...")
-        urllib.request.urlretrieve(url, dest_path)
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
 
     return dest_path
 
