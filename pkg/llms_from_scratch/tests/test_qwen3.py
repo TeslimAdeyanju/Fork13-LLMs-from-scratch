@@ -337,11 +337,20 @@ def test_model_variants(ModelClass, qwen3_weights_path, generate_fn):
     assert torch.equal(expect, out)
 
 
-def test_model_KV_noKV(qwen3_weights_path):
+def test_model_KV_noKV():
+    cfg = QWEN_CONFIG_06_B.copy()
+    cfg.update({
+        "n_layers": 2,
+        "emb_dim": 64,
+        "hidden_dim": 128,
+        "n_heads": 4,
+        "n_kv_groups": 2,
+        "head_dim": 16,
+        "dtype": torch.float32,
+    })
 
     torch.manual_seed(123)
-    model_KV = Qwen3ModelKV(QWEN_CONFIG_06_B)
-    model_KV.load_state_dict(torch.load(qwen3_weights_path))
+    model_KV = Qwen3ModelKV(cfg)
     model_KV.eval()
 
     tokenizer = Qwen3Tokenizer(
@@ -359,30 +368,38 @@ def test_model_KV_noKV(qwen3_weights_path):
         model=model_KV,
         idx=input_token_ids,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"]
+        context_size=cfg["context_length"]
     )
     del model_KV
 
     torch.manual_seed(123)
-    model_noKV = Qwen3Model(QWEN_CONFIG_06_B)
-    model_noKV.load_state_dict(torch.load(qwen3_weights_path))
+    model_noKV = Qwen3Model(cfg)
     model_noKV.eval()
 
     out_noKV = generate_text_simple(
         model=model_noKV,
         idx=input_token_ids,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"]
+        context_size=cfg["context_length"]
     )
 
     assert torch.equal(out_noKV, out_KV)
 
 
-def test_model_batched_KV(qwen3_weights_path):
+def test_model_batched_KV():
+    cfg = QWEN_CONFIG_06_B.copy()
+    cfg.update({
+        "n_layers": 2,
+        "emb_dim": 64,
+        "hidden_dim": 128,
+        "n_heads": 4,
+        "n_kv_groups": 2,
+        "head_dim": 16,
+        "dtype": torch.float32,
+    })
 
     torch.manual_seed(123)
-    model_KV = Qwen3ModelKV(QWEN_CONFIG_06_B)
-    model_KV.load_state_dict(torch.load(qwen3_weights_path))
+    model_KV = Qwen3ModelKV(cfg)
     model_KV.eval()
 
     tokenizer = Qwen3Tokenizer(
@@ -402,20 +419,19 @@ def test_model_batched_KV(qwen3_weights_path):
         model=model_KV,
         idx=input_token_ids,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"]
+        context_size=cfg["context_length"]
     )
     del model_KV
 
     torch.manual_seed(123)
-    model_KV_batched = Qwen3ModelKVBatched(QWEN_CONFIG_06_B)
-    model_KV_batched.load_state_dict(torch.load(qwen3_weights_path))
+    model_KV_batched = Qwen3ModelKVBatched(cfg)
     model_KV_batched.eval()
 
     out_KV_bs_1 = generate_text_simple_batched(
         model=model_KV_batched,
         idx=input_token_ids,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"]
+        context_size=cfg["context_length"]
     )
 
     assert torch.equal(out_KV, out_KV_bs_1)
@@ -436,7 +452,7 @@ def test_model_batched_KV(qwen3_weights_path):
         model=model_KV_batched,
         idx=input_tensor,
         max_new_tokens=5,
-        context_size=QWEN_CONFIG_06_B["context_length"],
+        context_size=cfg["context_length"],
     )
     assert torch.equal(out_KV.squeeze(0), out_KV_bs_2[0]), (out_KV.squeeze(0).shape, out_KV_bs_2[0].shape)
 
